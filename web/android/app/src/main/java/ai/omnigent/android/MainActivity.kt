@@ -36,6 +36,8 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * The single WebView host. Mirrors the iOS `WebShellView` + `OmnigentWebView`:
@@ -68,10 +70,13 @@ class MainActivity : AppCompatActivity() {
     private var rendererCrashes = 0
     private var lastRendererCrashAt = 0L
 
-    // Floating server switcher — mirrors the iOS `ServerSwitcher`. Always
-    // visible so it's always available as a recovery path (backward compatible
-    // with older web builds). Theme-aware via brand colors (light/dark XML).
+    // Floating server switcher — mirrors the iOS `ServerSwitcher`. Hidden while
+    // the web owns server selection over the bridge (its in-sidebar picker); a
+    // liveness watchdog reveals it on pages that never speak the protocol
+    // (older web builds, login redirects, broken loads) so it stays available
+    // as a recovery path. Theme-aware via brand colors (light/dark XML).
     private lateinit var switchButton: View
+    private val revealSwitcherFallback = Runnable { switchButton.visibility = View.VISIBLE }
 
     // WebChromeClient affordances that need Activity-scoped result launchers.
     // Transient by design: rotation is covered by configChanges (no recreation),
@@ -217,7 +222,86 @@ class MainActivity : AppCompatActivity() {
         )
 
         ensureNotificationPermission()
+        armServerSwitcherWatchdog()
         webView.loadUrl(serverUrl)
+    }
+
+    /**
+     * Hide the pill for a fresh navigation and arm the liveness watchdog: if
+     * the page never speaks the server-selection protocol over the bridge
+     * within [SWITCHER_LIVENESS_TIMEOUT_MS] — an older web build, a login
+     * redirect, or a broken page — reveal the pill so the user is never
+     * stranded without a way back to server selection. A page that does speak
+     * it owns the pill's visibility from then on (see [onServerSwitcherHidden]).
+     */
+    private fun armServerSwitcherWatchdog() {
+        switchButton.removeCallbacks(revealSwitcherFallback)
+        switchButton.visibility = View.GONE
+        switchButton.postDelayed(revealSwitcherFallback, SWITCHER_LIVENESS_TIMEOUT_MS)
+    }
+
+    /** Stand the watchdog down and show the pill now (broken-page recovery). */
+    private fun revealServerSwitcherNow() {
+        switchButton.removeCallbacks(revealSwitcherFallback)
+        switchButton.visibility = View.VISIBLE
+    }
+
+    /** The web drove the pill — honor it and stand the reveal watchdog down. */
+    private fun onServerSwitcherHidden(hidden: Boolean) {
+        switchButton.removeCallbacks(revealSwitcherFallback)
+        switchButton.visibility = if (hidden) View.GONE else View.VISIBLE
+    }
+
+    /**
+     * The web asked for the picker payload — proof the page hosts the
+     * in-sidebar server picker, so selection lives there and the pill stays
+     * down unless the web explicitly shows it.
+     */
+    private fun onServerPickerRequested() {
+        switchButton.removeCallbacks(revealSwitcherFallback)
+        emitServerPicker()
+    }
+
+    /**
+     * Answer a picker request with the current origin plus the managed and
+     * recent server lists (recents that duplicate a managed origin are
+     * dropped) — the payload the SPA's in-sidebar picker renders. Mirrors the
+     * iOS shell's `emitServerPicker`.
+     */
+    private fun emitServerPicker() {
+        val origin = pinnedOrigin ?: return
+        val store = ServerStore(this)
+        val payload =
+            JSONObject()
+                .put("currentOrigin", origin)
+                .put("managedServers", JSONArray(store.managed.serverUrls))
+                .put(
+                    "recentServers",
+                    JSONArray(store.recentServers().filterNot(store.managed::includes)),
+                )
+        webView.evaluateJavascript(
+            "window.__omnigentNativeEmitServerPicker && " +
+                "window.__omnigentNativeEmitServerPicker($payload);",
+            null,
+        )
+    }
+
+    /**
+     * Switch only to a server the picker itself offered — the same allow-list
+     * gate the desktop and iOS shells apply, so page script can't steer the
+     * shell to an arbitrary origin through the bridge.
+     */
+    private fun onSwitchServerRequested(url: String) {
+        val store = ServerStore(this)
+        if (url !in store.offeredServers()) return
+        store.connect(url)
+        val target = store.currentServerUrl()
+        originOf(target)?.let { reloadWithNewServer(target, it) }
+    }
+
+    /** "Connect to new server…" from the sidebar picker — manual URL entry. */
+    private fun onOpenServerSetupRequested() {
+        startActivity(Intent(this, ConnectActivity::class.java))
     }
 
     /** Build a WebView wired with the shell's settings, clients, and listeners. */
@@ -343,6 +427,9 @@ class MainActivity : AppCompatActivity() {
         ViewCompat.requestApplyInsets(webView)
 
         if (loopExhausted) {
+            // The local recovery page has no bridge — surface the pill straight
+            // away as the recovery affordance.
+            revealServerSwitcherNow()
             // Offline page (no network) so it can't re-trigger the crash.
             webView.loadDataWithBaseURL(
                 null,
@@ -357,6 +444,7 @@ class MainActivity : AppCompatActivity() {
         // Reload the user's route; a blank or foreign URL falls back to the root.
         val reloadUrl =
             if (lastUrl != null && originOf(lastUrl) == pinnedOrigin) lastUrl else serverUrl
+        armServerSwitcherWatchdog()
         webView.loadUrl(reloadUrl)
     }
 
@@ -429,6 +517,10 @@ class MainActivity : AppCompatActivity() {
                 OmnigentBridgeListener(
                     notifications = notifications,
                     blobSaver = blobSaver,
+                    onServerSwitcherHidden = ::onServerSwitcherHidden,
+                    onServerPickerRequested = ::onServerPickerRequested,
+                    onSwitchServer = ::onSwitchServerRequested,
+                    onOpenServerSetup = ::onOpenServerSetupRequested,
                 ),
             )
         } catch (_: IllegalArgumentException) {
@@ -544,6 +636,7 @@ class MainActivity : AppCompatActivity() {
             // budget on a failure that retrying can't fix. Stay put instead.
             if (!accepted) return@setCookie
             cookies.flush()
+            armServerSwitcherWatchdog()
             webView.loadUrl(origin)
         }
         startActivity(
@@ -652,6 +745,7 @@ class MainActivity : AppCompatActivity() {
         loginAttempts = 0
         (switchButton as? TextView)?.text = hostLabelOf(serverUrl)
         installBridge()
+        armServerSwitcherWatchdog()
         webView.loadUrl(serverUrl)
     }
 
@@ -920,5 +1014,10 @@ class MainActivity : AppCompatActivity() {
         // one-off crashes never accumulate.
         const val MAX_RENDERER_CRASHES = 3
         const val RENDERER_CRASH_WINDOW_MS = 60_000L
+
+        // How long after a navigation begins we wait for the page to speak the
+        // server-selection protocol before revealing the pill as a recovery
+        // path. Mirrors the iOS shell's bridgeLivenessTimeout.
+        const val SWITCHER_LIVENESS_TIMEOUT_MS = 6_000L
     }
 }

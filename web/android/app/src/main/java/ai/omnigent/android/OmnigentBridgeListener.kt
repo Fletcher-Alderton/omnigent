@@ -23,6 +23,14 @@ import org.json.JSONObject
 class OmnigentBridgeListener(
     private val notifications: NativeNotificationManager,
     private val blobSaver: BlobSaver,
+    /** Web drove the floating server-switcher pill's visibility. */
+    private val onServerSwitcherHidden: (Boolean) -> Unit = {},
+    /** Web asked for the server-picker payload (sidebar picker data). */
+    private val onServerPickerRequested: () -> Unit = {},
+    /** Web asked to re-point the shell at a picker-offered server URL. */
+    private val onSwitchServer: (String) -> Unit = {},
+    /** Web asked to open the shell's "connect to server" setup page. */
+    private val onOpenServerSetup: () -> Unit = {},
 ) : WebViewCompat.WebMessageListener {
     override fun onPostMessage(
         view: WebView,
@@ -93,6 +101,24 @@ class OmnigentBridgeListener(
                     mimeType = json.optString("mimeType").ifEmpty { "application/octet-stream" },
                     suggestedName = json.optString("name"),
                 )
+            }
+
+            // Server-selection protocol, mirroring the iOS bridge: the web
+            // steers the floating pill and hosts the sidebar picker.
+            "setServerSwitcherHidden" -> {
+                onServerSwitcherHidden(json.optBoolean("hidden", true))
+            }
+
+            "requestServerPicker" -> {
+                onServerPickerRequested()
+            }
+
+            "switchServer" -> {
+                onSwitchServer(json.optString("url").ifEmpty { return })
+            }
+
+            "openServerSetup" -> {
+                onOpenServerSetup()
             }
         }
     }

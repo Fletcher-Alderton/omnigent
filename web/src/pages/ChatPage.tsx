@@ -41,7 +41,11 @@ import {
   serverSwitcherHiddenForSurface,
   useSurfaceFrontmost,
 } from "@/hooks/useNativeServerSwitcher";
-import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
+import {
+  hasNativeServerSwitcherPill,
+  onNativeSidebarDrag,
+  setNativeServerSwitcherHidden,
+} from "@/lib/nativeBridge";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
 import {
@@ -1513,11 +1517,11 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     !!conversationId,
   );
   useEffect(() => {
-    if (!isIOSShell()) return;
+    if (!hasNativeServerSwitcherPill()) return;
     setNativeServerSwitcherHidden(serverSwitcherHiddenForSurface(surfaceFrontmost));
   }, [surfaceFrontmost]);
   useEffect(() => {
-    if (!isIOSShell()) return;
+    if (!hasNativeServerSwitcherPill()) return;
     return () => setNativeServerSwitcherHidden(true);
   }, []);
   // The conversation's scroll container + the StickToBottom controls needed to

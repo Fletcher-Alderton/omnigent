@@ -132,4 +132,77 @@ class OmnigentBridgeListenerTest {
         listener.handle("""{"count":5}""")
         assertEquals(0, shadow.allNotifications.size)
     }
+
+    /** Listener wired with recording server-selection callbacks. */
+    private fun serverSelectionListener(
+        hiddenCalls: MutableList<Boolean> = mutableListOf(),
+        pickerRequests: MutableList<Unit> = mutableListOf(),
+        switchCalls: MutableList<String> = mutableListOf(),
+        setupCalls: MutableList<Unit> = mutableListOf(),
+    ) = OmnigentBridgeListener(
+        notifications = NativeNotificationManager(context),
+        blobSaver = BlobSaver(context),
+        onServerSwitcherHidden = { hiddenCalls.add(it) },
+        onServerPickerRequested = { pickerRequests.add(Unit) },
+        onSwitchServer = { switchCalls.add(it) },
+        onOpenServerSetup = { setupCalls.add(Unit) },
+    )
+
+    @Test
+    fun `setServerSwitcherHidden drives the switcher callback both ways`() {
+        val hiddenCalls = mutableListOf<Boolean>()
+        val wired = serverSelectionListener(hiddenCalls = hiddenCalls)
+
+        wired.handle("""{"method":"setServerSwitcherHidden","hidden":true}""")
+        wired.handle("""{"method":"setServerSwitcherHidden","hidden":false}""")
+
+        assertEquals(listOf(true, false), hiddenCalls)
+    }
+
+    @Test
+    fun `setServerSwitcherHidden without a flag defaults to hidden`() {
+        val hiddenCalls = mutableListOf<Boolean>()
+        val wired = serverSelectionListener(hiddenCalls = hiddenCalls)
+
+        wired.handle("""{"method":"setServerSwitcherHidden"}""")
+
+        assertEquals(listOf(true), hiddenCalls)
+    }
+
+    @Test
+    fun `requestServerPicker and openServerSetup dispatch to their callbacks`() {
+        val pickerRequests = mutableListOf<Unit>()
+        val setupCalls = mutableListOf<Unit>()
+        val wired =
+            serverSelectionListener(pickerRequests = pickerRequests, setupCalls = setupCalls)
+
+        wired.handle("""{"method":"requestServerPicker"}""")
+        wired.handle("""{"method":"openServerSetup"}""")
+
+        assertEquals(1, pickerRequests.size)
+        assertEquals(1, setupCalls.size)
+    }
+
+    @Test
+    fun `switchServer forwards the URL and drops an empty or missing one`() {
+        val switchCalls = mutableListOf<String>()
+        val wired = serverSelectionListener(switchCalls = switchCalls)
+
+        wired.handle("""{"method":"switchServer","url":"https://other.example.test"}""")
+        wired.handle("""{"method":"switchServer","url":""}""")
+        wired.handle("""{"method":"switchServer"}""")
+
+        assertEquals(listOf("https://other.example.test"), switchCalls)
+    }
+
+    @Test
+    fun `server-selection messages on an unwired listener are no-ops`() {
+        // MainActivity always wires the callbacks; the defaults exist for
+        // partial embedders and must swallow the messages rather than crash.
+        listener.handle("""{"method":"setServerSwitcherHidden","hidden":true}""")
+        listener.handle("""{"method":"requestServerPicker"}""")
+        listener.handle("""{"method":"switchServer","url":"https://x.example.test"}""")
+        listener.handle("""{"method":"openServerSetup"}""")
+        assertEquals(0, shadow.allNotifications.size)
+    }
 }

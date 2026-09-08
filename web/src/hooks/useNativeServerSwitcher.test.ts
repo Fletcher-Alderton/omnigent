@@ -1,6 +1,11 @@
+import { renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { isSurfaceFrontmost, serverSwitcherHiddenForSurface } from "./useNativeServerSwitcher";
+import {
+  isSurfaceFrontmost,
+  serverSwitcherHiddenForSurface,
+  useNativeServerSwitcherForMainSurface,
+} from "./useNativeServerSwitcher";
 
 // The native Liquid Glass Chat/Terminal bar floats over the web view, so DOM
 // stacking can't hide it — its visibility rides on `isSurfaceFrontmost`. A
@@ -103,38 +108,83 @@ describe("isSurfaceFrontmost", () => {
 // Server selection moved into the sidebar picker on shells that host it, so
 // the floating pill must never be requested over the main surface there — it
 // used to crowd the chat header's title and floating controls on a notched
-// iPhone. Shells without the picker bridge (older iOS builds) keep the pill
-// as their only selection affordance, following the frontmost signal.
-describe("serverSwitcherHiddenForSurface", () => {
-  function setIOSBridge(withServerPicker: boolean): void {
-    (window as unknown as Record<string, unknown>).omnigentNative = {
-      kind: "ios",
-      setBadgeCount: () => {},
-      notify: () => Promise.resolve(false),
-      setServerSwitcherHidden: () => {},
-      ...(withServerPicker
-        ? {
-            getServerPicker: () => Promise.resolve(null),
-            switchServer: () => Promise.resolve(),
-            openServerSetup: () => {},
-          }
-        : {}),
-    };
-  }
+// iPhone, and to extend across the header's Chat/Terminal toggle on a
+// phone-width Android screen. Shells without the picker bridge (older
+// builds) keep the pill as their only selection affordance, following the
+// frontmost signal.
 
+function setMobileBridge(
+  kind: "ios" | "android",
+  withServerPicker: boolean,
+): ReturnType<typeof vi.fn> {
+  const setServerSwitcherHidden = vi.fn();
+  (window as unknown as Record<string, unknown>).omnigentNative = {
+    kind,
+    setBadgeCount: () => {},
+    notify: () => Promise.resolve(false),
+    setServerSwitcherHidden,
+    ...(withServerPicker
+      ? {
+          getServerPicker: () => Promise.resolve(null),
+          switchServer: () => Promise.resolve(),
+          openServerSetup: () => {},
+        }
+      : {}),
+  };
+  return setServerSwitcherHidden;
+}
+
+describe("serverSwitcherHiddenForSurface", () => {
   afterEach(() => {
     delete (window as unknown as Record<string, unknown>).omnigentNative;
   });
 
   it("keeps the pill hidden over a frontmost surface on a shell with the sidebar picker", () => {
-    setIOSBridge(true);
+    setMobileBridge("ios", true);
     expect(serverSwitcherHiddenForSurface(true)).toBe(true);
     expect(serverSwitcherHiddenForSurface(false)).toBe(true);
   });
 
   it("follows the frontmost signal on a shell without the sidebar picker", () => {
-    setIOSBridge(false);
+    setMobileBridge("ios", false);
     expect(serverSwitcherHiddenForSurface(true)).toBe(false);
     expect(serverSwitcherHiddenForSurface(false)).toBe(true);
+  });
+
+  it("keeps the pill hidden on a picker-capable Android shell too", () => {
+    setMobileBridge("android", true);
+    expect(serverSwitcherHiddenForSurface(true)).toBe(true);
+    expect(serverSwitcherHiddenForSurface(false)).toBe(true);
+  });
+});
+
+// The hook is the piece that was iOS-gated: on an Android shell it silently
+// dropped every hide request, so the always-visible native pill floated
+// across the chat header's Web/TUI toggle. It must drive the bridge on both
+// WebView shells and stay quiet everywhere else.
+describe("useNativeServerSwitcherForMainSurface", () => {
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).omnigentNative;
+  });
+
+  it("asks a picker-capable Android shell to keep the pill hidden over the main surface", () => {
+    const hidden = setMobileBridge("android", true);
+
+    const { unmount } = renderHook(() => useNativeServerSwitcherForMainSurface(null, true));
+    expect(hidden).toHaveBeenCalledWith(true);
+    expect(hidden.mock.calls.every(([value]) => value === true)).toBe(true);
+
+    unmount();
+    expect(hidden.mock.calls.at(-1)).toEqual([true]);
+  });
+
+  it("asks a picker-capable iOS shell the same way", () => {
+    const hidden = setMobileBridge("ios", true);
+
+    const { unmount } = renderHook(() => useNativeServerSwitcherForMainSurface(null, true));
+    expect(hidden).toHaveBeenCalledWith(true);
+
+    unmount();
+    expect(hidden.mock.calls.at(-1)).toEqual([true]);
   });
 });

@@ -493,12 +493,24 @@ export function supportsNativeServerPicker(): boolean {
 /**
  * True when running inside the native Android WebView shell. A sibling to
  * {@link isIOSShell} — deliberately NOT folded into it, since the iOS-only
- * chrome (viewport lock, native keyboard inset, server switcher) keys off
- * `isIOSShell()` and must stay off on Android, which uses its own WebView
- * keyboard/inset behavior and the web in-page fallbacks.
+ * chrome (viewport lock, native keyboard inset) keys off `isIOSShell()` and
+ * must stay off on Android, which uses its own WebView keyboard/inset
+ * behavior and the web in-page fallbacks.
  */
 export function isAndroidShell(): boolean {
   return nativeApi()?.kind === "android";
+}
+
+/**
+ * True on shells that float a native server-switcher pill over the web
+ * surface — the iOS and Android WebView shells — i.e. the chrome the web
+ * must steer via {@link setNativeServerSwitcherHidden} so the pill never
+ * sits across the chat header's floating controls. The Electron shell docks
+ * its picker in the sidebar and floats nothing.
+ */
+export function hasNativeServerSwitcherPill(): boolean {
+  const kind = nativeApi()?.kind;
+  return kind === "ios" || kind === "android";
 }
 
 /**

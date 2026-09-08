@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   getServerPicker,
+  hasNativeServerSwitcherPill,
   isAndroidShell,
   isElectronShell,
   isIOSShell,
@@ -39,14 +40,19 @@ const iosSetSidebarOpen = vi.fn();
 const iosGetServerPicker = vi.fn();
 const iosSwitchServer = vi.fn().mockResolvedValue(undefined);
 
-// The Android WebView bridge mock, installed on window.omnigentNative. The MVP
-// Android shell exposes the shell-agnostic subset (notifications + badge); the
-// optional iOS-only chrome (sidebar drag, server switcher, view mode) is absent.
+// The Android WebView bridge mock, installed on window.omnigentNative. The
+// base shell exposes the shell-agnostic subset (notifications + badge); the
+// server-selection surface (switcher hide + picker trio) is optional so tests
+// can exercise shells from before it existed. The iOS-only chrome (sidebar
+// drag, view mode) stays absent.
 const androidSetBadge = vi.fn();
 const androidNotify = vi.fn().mockResolvedValue(true);
 const androidUnsubscribe = vi.fn();
 const androidOnNotificationActivated = vi.fn().mockReturnValue(androidUnsubscribe);
 const androidSetColorScheme = vi.fn();
+const androidSetServerSwitcherHidden = vi.fn();
+const androidGetServerPicker = vi.fn();
+const androidSwitchServer = vi.fn().mockResolvedValue(undefined);
 
 /**
  * Simulate running inside / outside the Electron shell via the preload key.
@@ -109,8 +115,13 @@ function setIOS(on: boolean, withClickRouting = true, withServerPicker = false):
   }
 }
 
-/** Simulate running inside / outside the Android shell via the WebView bridge. */
-function setAndroid(on: boolean, withClickRouting = true): void {
+/**
+ * Simulate running inside / outside the Android shell via the WebView bridge.
+ * `withServerSelection` toggles the server-selection surface (the switcher
+ * hide affordance plus the picker trio) so tests can also exercise a shell
+ * from before it existed — one whose floating pill the web cannot steer.
+ */
+function setAndroid(on: boolean, withClickRouting = true, withServerSelection = false): void {
   if (on) {
     (window as unknown as Record<string, unknown>).omnigentNative = {
       kind: "android",
@@ -121,6 +132,15 @@ function setAndroid(on: boolean, withClickRouting = true): void {
         ? {
             onNotificationActivated: (...args: unknown[]) =>
               androidOnNotificationActivated(...args),
+          }
+        : {}),
+      ...(withServerSelection
+        ? {
+            setServerSwitcherHidden: (...args: unknown[]) =>
+              androidSetServerSwitcherHidden(...args),
+            getServerPicker: (...args: unknown[]) => androidGetServerPicker(...args),
+            switchServer: (...args: unknown[]) => androidSwitchServer(...args),
+            openServerSetup: () => {},
           }
         : {}),
     };
@@ -537,6 +557,44 @@ describe("setNativeServerSwitcherHidden", () => {
     });
     expect(() => setNativeServerSwitcherHidden(true)).not.toThrow();
   });
+
+  it("routes switcher visibility through the Android bridge", () => {
+    setAndroid(true, true, true);
+    setNativeServerSwitcherHidden(true);
+    setNativeServerSwitcherHidden(false);
+    expect(androidSetServerSwitcherHidden).toHaveBeenNthCalledWith(1, true);
+    expect(androidSetServerSwitcherHidden).toHaveBeenNthCalledWith(2, false);
+  });
+
+  it("is a no-op on an Android shell without the hide affordance", () => {
+    setAndroid(true);
+    expect(() => setNativeServerSwitcherHidden(true)).not.toThrow();
+    expect(androidSetServerSwitcherHidden).not.toHaveBeenCalled();
+  });
+});
+
+// The floating pill is mobile-shell chrome: both WebView shells float one the
+// web must steer clear of the chat header; Electron docks its picker in the
+// sidebar and floats nothing.
+describe("hasNativeServerSwitcherPill", () => {
+  it("is false in a plain browser", () => {
+    expect(hasNativeServerSwitcherPill()).toBe(false);
+  });
+
+  it("is true on the iOS shell", () => {
+    setIOS(true);
+    expect(hasNativeServerSwitcherPill()).toBe(true);
+  });
+
+  it("is true on the Android shell (which floats the same pill)", () => {
+    setAndroid(true);
+    expect(hasNativeServerSwitcherPill()).toBe(true);
+  });
+
+  it("is false on the Electron shell (its picker docks in the sidebar)", () => {
+    setElectron(true);
+    expect(hasNativeServerSwitcherPill()).toBe(false);
+  });
 });
 
 describe("supportsNativeServerPicker", () => {
@@ -559,6 +617,16 @@ describe("supportsNativeServerPicker", () => {
     delete (window as unknown as { omnigentNative: Record<string, unknown> }).omnigentNative
       .openServerSetup;
     expect(supportsNativeServerPicker()).toBe(false);
+  });
+
+  it("is false on an Android shell without the picker bridge (floating-pill era)", () => {
+    setAndroid(true);
+    expect(supportsNativeServerPicker()).toBe(false);
+  });
+
+  it("is true on an Android shell exposing the picker bridge", () => {
+    setAndroid(true, true, true);
+    expect(supportsNativeServerPicker()).toBe(true);
   });
 });
 
@@ -591,5 +659,29 @@ describe("getServerPicker / switchServer over the iOS bridge", () => {
     setIOS(true, true, true);
     iosGetServerPicker.mockRejectedValueOnce(new Error("bridge down"));
     await expect(getServerPicker()).resolves.toBeNull();
+  });
+
+  it("resolves the Android shell's picker payload", async () => {
+    setAndroid(true, true, true);
+    const info = {
+      currentOrigin: "https://droid.example.test",
+      managedServers: ["https://managed.example.test"],
+      recentServers: ["https://other.example.test"],
+    };
+    androidGetServerPicker.mockResolvedValue(info);
+
+    await expect(getServerPicker()).resolves.toEqual(info);
+  });
+
+  it("resolves null on an Android shell without the picker bridge", async () => {
+    setAndroid(true);
+    await expect(getServerPicker()).resolves.toBeNull();
+    expect(androidGetServerPicker).not.toHaveBeenCalled();
+  });
+
+  it("routes a switch request through the Android bridge", async () => {
+    setAndroid(true, true, true);
+    await switchServer("https://other.example.test");
+    expect(androidSwitchServer).toHaveBeenCalledWith("https://other.example.test");
   });
 });
