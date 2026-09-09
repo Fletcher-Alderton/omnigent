@@ -10,7 +10,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type InfiniteData, type QueryClient, useQueryClient } from "@tanstack/react-query";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
-import { authenticatedFetch } from "@/lib/identity";
+import { getOmnigentServerIdentity } from "@/lib/host";
+import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { dedupeConversationsById } from "@/shell/sidebarNav";
 
 /** First page when nothing is cached: small, so the first paint is quick. */
@@ -20,6 +21,8 @@ export const SESSION_PAGE_LIMIT = 1_000;
 export const MAX_SESSION_PAGES = 200;
 export const MAX_SESSIONS = 5_000;
 export const SESSION_POLL_INTERVAL_MS = 30_000;
+const SESSION_CACHE_VERSION = 1;
+const SESSION_CACHE_KEY_PREFIX = "omnigent:canvas-sessions";
 
 export interface SessionLoadProgress {
   sessions: Conversation[];
@@ -36,6 +39,81 @@ export interface CanvasSessions {
   complete: boolean;
   error: string | null;
   refresh: () => Promise<void>;
+}
+
+// QueryClient survives route changes; scoping the remembered list to it keeps
+// separate app roots and tests isolated while making revisits instantaneous.
+const completeSessionsByClient = new WeakMap<QueryClient, Conversation[]>();
+
+interface StoredCanvasSessions {
+  version: number;
+  sessions: Conversation[];
+}
+
+function sessionCachePrefix(): string {
+  const server = getOmnigentServerIdentity() ?? "default";
+  return `${SESSION_CACHE_KEY_PREFIX}:${server}`;
+}
+
+function sessionCacheKey(viewerId: string | null = getCurrentUserId()): string {
+  return `${sessionCachePrefix()}:${viewerId ?? "anonymous"}`;
+}
+
+function hasStoredSessionsForServer(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    const prefix = `${sessionCachePrefix()}:`;
+    return Array.from({ length: window.sessionStorage.length }, (_, index) =>
+      window.sessionStorage.key(index),
+    ).some((key) => key?.startsWith(prefix));
+  } catch {
+    return false;
+  }
+}
+
+function isStoredConversation(value: unknown): value is Conversation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Partial<Conversation>;
+  return (
+    typeof row.id === "string" &&
+    typeof row.updated_at === "number" &&
+    Number.isFinite(row.updated_at) &&
+    typeof row.status === "string"
+  );
+}
+
+function readStoredSessions(
+  viewerId: string | null = getCurrentUserId(),
+): Conversation[] | undefined {
+  if (typeof window === "undefined") return undefined;
+  try {
+    const raw = window.sessionStorage.getItem(sessionCacheKey(viewerId));
+    if (!raw) return undefined;
+    const stored = JSON.parse(raw) as Partial<StoredCanvasSessions> | null;
+    if (
+      !stored ||
+      stored.version !== SESSION_CACHE_VERSION ||
+      !Array.isArray(stored.sessions) ||
+      stored.sessions.length > MAX_SESSIONS ||
+      !stored.sessions.every(isStoredConversation)
+    ) {
+      return undefined;
+    }
+    return dedupeConversationsById(stored.sessions.filter(isTopLevelActive));
+  } catch {
+    return undefined;
+  }
+}
+
+function rememberCompleteSessions(queryClient: QueryClient, sessions: Conversation[]): void {
+  completeSessionsByClient.set(queryClient, sessions);
+  if (typeof window === "undefined") return;
+  try {
+    const stored: StoredCanvasSessions = { version: SESSION_CACHE_VERSION, sessions };
+    window.sessionStorage.setItem(sessionCacheKey(), JSON.stringify(stored));
+  } catch {
+    // Memory caching still works when storage is disabled or full.
+  }
 }
 
 export function isTopLevelActive(session: Conversation): boolean {
@@ -184,18 +262,32 @@ export function applyLiveRows(
 
 export function useCanvasSessions(): CanvasSessions {
   const queryClient = useQueryClient();
+  const [awaitingStoredIdentity, setAwaitingStoredIdentity] = useState(() => {
+    if (completeSessionsByClient.has(queryClient)) return false;
+    const viewerId = getCurrentUserId();
+    return (
+      viewerId === null &&
+      readStoredSessions(viewerId) === undefined &&
+      hasStoredSessionsForServer()
+    );
+  });
   const [state, setState] = useState(() => {
-    const preview = cachedSessionPreview(queryClient);
+    const remembered =
+      completeSessionsByClient.get(queryClient) ??
+      (awaitingStoredIdentity ? undefined : readStoredSessions());
+    if (remembered) completeSessionsByClient.set(queryClient, remembered);
+    const sessions =
+      remembered ?? (awaitingStoredIdentity ? [] : cachedSessionPreview(queryClient));
     return {
-      sessions: preview,
-      loaded: preview.length > 0,
+      sessions,
+      loaded: remembered !== undefined || sessions.length > 0,
       loadingMore: false,
-      complete: false,
+      complete: remembered !== undefined,
       error: null as string | null,
     };
   });
   const sessionsRef = useRef(state.sessions);
-  const completeRef = useRef(false);
+  const completeRef = useRef(state.complete);
   const inFlightRef = useRef<Promise<void> | null>(null);
   const aliveRef = useRef(true);
 
@@ -205,6 +297,31 @@ export function useCanvasSessions(): CanvasSessions {
       aliveRef.current = false;
     };
   }, []);
+
+  // A persisted cache may be keyed by an identity that is still resolving on
+  // startup. Wait rather than flashing the short anonymous sidebar preview.
+  useEffect(() => {
+    if (!awaitingStoredIdentity) return;
+    let cancelled = false;
+    void resolveIdentity().then((viewerId) => {
+      if (cancelled) return;
+      const remembered = readStoredSessions(viewerId);
+      const sessions = remembered ?? cachedSessionPreview(queryClient);
+      sessionsRef.current = sessions;
+      completeRef.current = remembered !== undefined;
+      if (remembered) completeSessionsByClient.set(queryClient, remembered);
+      setState((current) => ({
+        ...current,
+        sessions,
+        loaded: remembered !== undefined || sessions.length > 0,
+        complete: remembered !== undefined,
+      }));
+      setAwaitingStoredIdentity(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [awaitingStoredIdentity, queryClient]);
 
   const refresh = useCallback((): Promise<void> => {
     if (inFlightRef.current) return inFlightRef.current;
@@ -216,12 +333,17 @@ export function useCanvasSessions(): CanvasSessions {
     const request = (async () => {
       try {
         await loadAllSessions(existing, (progress) => {
-          if (!aliveRef.current) return;
           const sessions = progress.hasMore
             ? mergePartial(existing, progress.sessions)
             : progress.sessions;
+          // Keep the completed list even if this page unmounted while loading.
+          // A later Canvas visit can then paint the whole list immediately.
+          if (!progress.hasMore) rememberCompleteSessions(queryClient, sessions);
+          if (!aliveRef.current) return;
           sessionsRef.current = sessions;
-          if (!progress.hasMore) completeRef.current = true;
+          if (!progress.hasMore) {
+            completeRef.current = true;
+          }
           setState((current) => ({
             ...current,
             sessions,
@@ -248,11 +370,12 @@ export function useCanvasSessions(): CanvasSessions {
       if (inFlightRef.current === request) inFlightRef.current = null;
     });
     return request;
-  }, []);
+  }, [queryClient]);
 
   // Initial load, then poll like the sidebar does and catch up when the tab
   // becomes visible or the window regains focus.
   useEffect(() => {
+    if (awaitingStoredIdentity) return;
     void refresh();
     const refreshIfVisible = () => {
       if (!document.hidden) void refresh();
@@ -265,7 +388,7 @@ export function useCanvasSessions(): CanvasSessions {
       window.removeEventListener("focus", refreshIfVisible);
       document.removeEventListener("visibilitychange", refreshIfVisible);
     };
-  }, [refresh]);
+  }, [awaitingStoredIdentity, refresh]);
 
   // Live updates: the sessions stream patches the sidebar's cache in place;
   // mirror those rows so cards change with the sidebar instead of on the next poll.
@@ -280,6 +403,7 @@ export function useCanvasSessions(): CanvasSessions {
         return;
       }
       sessionsRef.current = next;
+      if (completeRef.current) completeSessionsByClient.set(queryClient, next);
       setState((current) => ({ ...current, sessions: next }));
     };
     const unsubscribe = queryClient.getQueryCache().subscribe((event) => {

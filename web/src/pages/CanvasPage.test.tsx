@@ -200,6 +200,8 @@ describe("CanvasPage", () => {
     const nodes = flowProps.current?.nodes as { initialWidth: number; initialHeight: number }[];
     expect(nodes).toHaveLength(600);
     expect(nodes[0]).toMatchObject({ initialWidth: 280, initialHeight: 132 });
+    // Cards snap to the layout lattice while dragging.
+    expect(flowProps.current).toMatchObject({ snapToGrid: true, snapGrid: [32, 32] });
   });
 
   it("refits on a tab change or layout reset, but not on status-only updates", async () => {
@@ -277,12 +279,32 @@ describe("CanvasPage", () => {
     expect(screen.getByTestId("location")).toHaveTextContent(/^\/canvas$/);
   });
 
+  it("reopens the last selected canvas on a visit without a URL parameter", () => {
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
+    const { unmount } = renderPage();
+    fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
+    unmount();
+
+    const revisit = renderPage();
+    expect(screen.getByRole("tab", { name: "Alpha" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("location")).toHaveTextContent("/canvas?canvas=proj_a");
+    revisit.unmount();
+
+    // An explicit URL still wins over the remembered canvas.
+    renderPage("/canvas?canvas=name%3ALegacy");
+    expect(screen.getByRole("tab", { name: "Legacy" })).toHaveAttribute("aria-selected", "true");
+  });
+
   it("falls back to Main when the URL names a canvas that no longer exists", () => {
     vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
     renderPage("/canvas?canvas=proj_gone");
 
     expect(screen.getByRole("tab", { name: "Main" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("location")).toHaveTextContent(/^\/canvas$/);
+    // The stale choice is forgotten too, so the next visit does not retry it.
+    cleanup();
+    renderPage();
+    expect(screen.getByRole("tab", { name: "Main" })).toHaveAttribute("aria-selected", "true");
   });
 
   it("shows explicit empty states per canvas", () => {
@@ -319,31 +341,48 @@ describe("CanvasPage", () => {
     expect(screen.getByTestId("location")).toHaveTextContent("/c/conv_1");
   });
 
-  it("persists dragged positions and restores them on the next mount", async () => {
+  it("saves every card's spot once complete, so a moved card leaves the others in place", async () => {
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
       sessionsStub([conversation("conv_1", 2), conversation("conv_2", 1)]),
     );
     const { unmount } = renderPage();
+    // Grid slots are saved as soon as the full list is known, not only after a drag.
+    expect(readCanvasLayout(null)).toEqual({
+      positions: { conv_1: { x: 0, y: 0 }, conv_2: { x: 320, y: 0 } },
+    });
     const dragStop = flowProps.current?.onNodeDragStop as (
       event: MouseEvent,
       node: { id: string; position: { x: number; y: number } },
     ) => void;
     act(() => {
-      dragStop(new MouseEvent("mouseup"), { id: "conv_2", position: { x: 400.4, y: 120.6 } });
+      dragStop(new MouseEvent("mouseup"), { id: "conv_1", position: { x: 960.4, y: 480.6 } });
     });
-    expect(readCanvasLayout(null)).toEqual({ positions: { conv_2: { x: 400, y: 121 } } });
+    expect(readCanvasLayout(null).positions).toEqual({
+      conv_2: { x: 320, y: 0 },
+      conv_1: { x: 960, y: 481 },
+    });
     unmount();
 
     renderPage();
     await waitFor(() =>
-      expect(screen.getByTestId("flow-node-conv_2")).toHaveAttribute("data-x", "400"),
+      expect(screen.getByTestId("flow-node-conv_1")).toHaveAttribute("data-x", "960"),
     );
-    expect(screen.getByTestId("flow-node-conv_2")).toHaveAttribute("data-y", "121");
+    expect(screen.getByTestId("flow-node-conv_1")).toHaveAttribute("data-y", "481");
+    // The unmoved card keeps its slot instead of sliding into the vacated one.
+    expect(screen.getByTestId("flow-node-conv_2")).toHaveAttribute("data-x", "320");
     // The restored layout is fitted like any other first paint.
     await waitFor(() => expect(flowFitView).toHaveBeenCalled());
   });
 
-  it("resets only the active canvas's saved positions", () => {
+  it("does not save grid slots while the list is still loading", () => {
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("conv_1", 2)], { loadingMore: true, complete: false }),
+    );
+    renderPage();
+    expect(readCanvasLayout(null)).toEqual({ positions: {} });
+  });
+
+  it("resets only the active canvas's positions to grid slots", () => {
     vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
       sessionsStub([
@@ -364,7 +403,10 @@ describe("CanvasPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Reset layout" }));
 
     expect(screen.getByTestId("flow-node-conv_main")).toHaveAttribute("data-x", "0");
-    expect(readCanvasLayout(null)).toEqual({ positions: { conv_alpha: { x: 50, y: 50 } } });
+    expect(readCanvasLayout(null).positions).toEqual({
+      conv_alpha: { x: 50, y: 50 },
+      conv_main: { x: 0, y: 0 },
+    });
   });
 
   it("forgets saved spots of deleted sessions once the list is complete", () => {

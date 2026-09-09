@@ -15,10 +15,13 @@
  * - Pull requests come through the GitHub panel's query cache
  *   (`fetchGithubInfo`), throttled per session by `usePullRequests`.
  * - Card positions live in localStorage (`canvasStorage.ts`), keyed by server
- *   identity; the server never learns the layout. The view itself is not
- *   saved: every canvas opens fitted to its cards and stays fitted until the
- *   user pans or zooms by hand.
- * - The selected canvas lives in `?canvas=<id>` so a reload keeps the tab.
+ *   identity and viewer; the server never learns the layout. Every card's spot
+ *   is saved once the full list is known — grid slots included — so nothing
+ *   moves on a reload, and cards snap to a `GRID_STEP` lattice while dragging.
+ *   The view itself is not saved: every canvas opens fitted to its cards and
+ *   stays fitted until the user pans or zooms by hand.
+ * - The selected canvas lives in `?canvas=<id>` so a reload keeps the tab, and
+ *   is remembered per server so coming back to `/canvas` reopens it.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -42,21 +45,23 @@ import {
 import {
   CARD_HEIGHT,
   CARD_WIDTH,
+  GRID_STEP,
   MAIN_CANVAS_ID,
   mergeCanvasPositions,
   mergeSessionPositions,
   projectCanvasId,
-  prunePositions,
+  samePositions,
   sessionsOnCanvas,
   type CanvasPositions,
 } from "@/canvas/canvasLayout";
 import { useCanvasSessions } from "@/canvas/canvasSessions";
 import {
   EMPTY_CANVAS_LAYOUT,
+  readActiveCanvas,
   readCanvasLayout,
-  withoutPositions,
   withPosition,
   withPositions,
+  writeActiveCanvas,
   writeCanvasLayout,
   type CanvasLayout,
 } from "@/canvas/canvasStorage";
@@ -77,6 +82,7 @@ import "@xyflow/react/dist/style.css";
 const nodeTypes = { session: SessionCard };
 const proOptions = { hideAttribution: true };
 const FIT_VIEW = { padding: 0.2, maxZoom: 1 };
+const SNAP_GRID: [number, number] = [GRID_STEP, GRID_STEP];
 const MIN_ZOOM = 0.05;
 const MAX_ZOOM = 2.5;
 const RESIZE_REFIT_DELAY_MS = 100;
@@ -154,8 +160,9 @@ function CanvasSurface() {
   const projects = projectsQuery.data ?? EMPTY_PROJECTS;
 
   const [nodes, setNodes] = useState<SessionCardNode[]>([]);
+  // The URL names the canvas; without it, reopen the one last selected here.
   const [activeCanvas, setActiveCanvas] = useState(
-    () => searchParams.get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID,
+    () => searchParams.get(CANVAS_QUERY_PARAM) ?? readActiveCanvas() ?? MAIN_CANVAS_ID,
   );
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
   const activeCanvasRef = useRef(activeCanvas);
@@ -271,7 +278,16 @@ function CanvasSurface() {
       { ...layoutRef.current.positions, ...positionsRef.current },
       viewerId,
     );
-  }, [sessions, projects, viewerId]);
+    // Once the full list is known, save every card's spot, grid slots included,
+    // so unmoved cards stay put on the next load; spots of deleted sessions go.
+    if (
+      complete &&
+      projectsQuery.data !== undefined &&
+      !samePositions(layoutRef.current.positions, positionsRef.current)
+    ) {
+      persist(withPositions(layoutRef.current, positionsRef.current));
+    }
+  }, [complete, persist, projects, projectsQuery.data, sessions, viewerId]);
 
   // Cards follow the active canvas; drags update the node state directly and
   // land in positionsRef on drop, so rebuilding here never loses a move.
@@ -308,6 +324,16 @@ function CanvasSurface() {
     [setSearchParams],
   );
 
+  // A visit without `?canvas=` reopened the remembered canvas; put it in the URL.
+  const restoredParamRef = useRef(false);
+  useEffect(() => {
+    if (restoredParamRef.current) return;
+    restoredParamRef.current = true;
+    if (!searchParams.has(CANVAS_QUERY_PARAM) && activeCanvasRef.current !== MAIN_CANVAS_ID) {
+      writeCanvasParam(activeCanvasRef.current);
+    }
+  }, [searchParams, writeCanvasParam]);
+
   const selectCanvas = useCallback(
     (canvasId: string) => {
       if (activeCanvasRef.current === canvasId) return;
@@ -315,6 +341,7 @@ function CanvasSurface() {
       activeCanvasRef.current = canvasId;
       setActiveCanvas(canvasId);
       writeCanvasParam(canvasId);
+      writeActiveCanvas(canvasId);
       scheduleFit();
     },
     [scheduleFit, trackClick, writeCanvasParam],
@@ -327,21 +354,9 @@ function CanvasSurface() {
     activeCanvasRef.current = MAIN_CANVAS_ID;
     setActiveCanvas(MAIN_CANVAS_ID);
     writeCanvasParam(MAIN_CANVAS_ID);
+    writeActiveCanvas(MAIN_CANVAS_ID);
     scheduleFit();
   }, [activeCanvas, projects, projectsQuery.data, scheduleFit, writeCanvasParam]);
-
-  // Once the full list is known, forget spots of sessions that no longer exist.
-  useEffect(() => {
-    if (!complete) return;
-    const layout = layoutRef.current;
-    const pruned = prunePositions(
-      layout.positions,
-      sessions.map((session) => session.id),
-    );
-    if (Object.keys(pruned).length !== Object.keys(layout.positions).length) {
-      persist(withPositions(layout, pruned));
-    }
-  }, [complete, persist, sessions]);
 
   // A project created from the tab strip is selected once the list includes it.
   useEffect(() => {
@@ -405,7 +420,7 @@ function CanvasSurface() {
     positionsRef.current = { ...kept, ...mergeSessionPositions(visibleSessions, {}) };
     scheduleFit();
     setNodes(nodesFor(visibleSessions, positionsRef.current, pullRequests));
-    persist(withoutPositions(layoutRef.current, ids));
+    persist(withPositions(layoutRef.current, positionsRef.current));
   }, [nodesFor, persist, pullRequests, scheduleFit, trackClick, visibleSessions]);
 
   const newSession = () => {
@@ -540,13 +555,15 @@ function CanvasSurface() {
           zoomOnDoubleClick={false}
           panOnScroll
           nodeDragThreshold={3}
+          snapToGrid
+          snapGrid={SNAP_GRID}
           onlyRenderVisibleElements
           minZoom={MIN_ZOOM}
           maxZoom={MAX_ZOOM}
           proOptions={proOptions}
         >
           {visibleSessions.length > 0 && (
-            <Background color="var(--border)" bgColor="var(--background)" />
+            <Background gap={GRID_STEP} color="var(--border)" bgColor="var(--background)" />
           )}
           <CanvasControls
             onZoom={markViewportDirty}
